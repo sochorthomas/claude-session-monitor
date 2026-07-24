@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Runtime data lives in ~/.claude (session-status/, session-monitor-config.json),
+# never inside the repo - nothing to ignore here.
