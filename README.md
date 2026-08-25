@@ -47,13 +47,20 @@ needed — and one click jumps you straight to that window.
 
 ```powershell
 git clone https://github.com/sochorthomas/claude-session-monitor.git
+```
+
+Then **double-click `install.cmd`**, or from a terminal:
+
+```powershell
 cd claude-session-monitor
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-`install.ps1` registers the hooks in `~/.claude/settings.json`. It only touches
-its own entries — your other settings, your other hooks, and even your own hooks
-on the same events are left alone — and it is safe to re-run. Then:
+Either way `install.ps1` registers the hooks in `~/.claude/settings.json`. It
+only touches its own entries — your other settings, your other hooks, and even
+your own hooks on the same events are left alone — and it is safe to re-run. It
+finishes by running the hook exactly the way Claude Code will, so a broken
+install says so instead of looking like an empty box. Then:
 
 1. **Reload Claude Code** so it picks up the new hooks
    (VS Code: `Ctrl+Shift+P` → *Developer: Reload Window*).
@@ -133,17 +140,25 @@ exactly the rows you care about.
 
 ### Repository layout
 
-The three things you run yourself sit in the root; everything they call lives in
-`scripts/`.
+Everything you run yourself sits in the root and can be double-clicked;
+everything it calls lives beside it or in `scripts/`.
 
 ```
-install.ps1               register the hooks
-uninstall.ps1             remove them again
+install.cmd               register the hooks (double-click this)
+uninstall.cmd             remove everything again (double-click this)
 start-monitor.vbs         start the widget (double-click this)
 widget.pyw                the widget itself
 hook.py                   what Claude Code runs on every hook event
+install.ps1               what install.cmd runs
+uninstall.ps1             what uninstall.cmd runs
 scripts/start-monitor.ps1 finds Python, launches widget.pyw
 ```
+
+The `.cmd` files exist because double-clicking a `.ps1` opens it in an editor
+rather than running it. They keep the console open so you can read the result,
+and `uninstall.cmd` asks before it does anything — the confirmation lives there
+rather than in the script, so `uninstall.ps1` stays non-interactive for anything
+else that drives it.
 
 ## Controls
 
@@ -182,6 +197,9 @@ The whole layout is sized from the display's DPI, so it stays proportional at
 size — it scales the text along with everything else.
 
 ## Uninstall
+
+**Double-click `uninstall.cmd`** — it lists what it is about to do and waits for
+you to type `Y` (or `K` to keep your saved settings) — or from a terminal:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
