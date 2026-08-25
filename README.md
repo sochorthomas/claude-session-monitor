@@ -28,6 +28,10 @@ needed — and one click jumps you straight to that window.
   twice even when Claude Code changes a session's id mid-flight
 - **Unobtrusive** — frameless and collapsible to a thin strip; drag the header
   to move it and the right edge to resize it, and it remembers both
+- **One instance** — launching it again (Startup shortcut plus an impatient
+  double-click) brings up nothing rather than a second box on top of the first
+- **Sharp on scaled displays** — laid out for the monitor's DPI instead of
+  being stretched by Windows
 - No dependencies beyond Python's standard library
 
 ## Requirements
@@ -156,6 +160,11 @@ Position, width and the sound toggle are remembered in
 `~/.claude/session-monitor-config.json`. A saved position on a monitor that is
 no longer attached is ignored rather than leaving the box off-desktop.
 
+The whole layout is sized from the display's DPI, so it stays proportional at
+125% or 200% instead of being bitmap-stretched. Set `CLAUDE_MONITOR_SCALE` (e.g.
+`1.4`) to override that and make the box larger or smaller than the automatic
+size — it scales the text along with everything else.
+
 ## Uninstall
 
 ```powershell
@@ -188,9 +197,10 @@ Claude Code. Close the widget with its `×` button.
 - **It stopped working after I moved or reinstalled Python.** The interpreter
   path is baked into the hook command, so re-run `install.ps1`. Same after
   moving the repository itself.
-- **Double-clicking `start-monitor.vbs` does nothing.** Make sure Python is
-  installed and on `PATH`. To see the error the `.vbs` swallows, run the
-  launcher directly: `powershell -File .\scripts\start-monitor.ps1`.
+- **Double-clicking `start-monitor.vbs` does nothing.** If the box is already on
+  screen, that is the single-instance guard doing its job. Otherwise make sure
+  Python is installed and on `PATH`; to see the error the `.vbs` swallows, run
+  the launcher directly: `powershell -File .\scripts\start-monitor.ps1`.
 - **Note on the Microsoft Store build of Python:** its process appears as
   `pythonw3.13.exe` (not `pythonw.exe`) in Task Manager — that's expected.
 

@@ -17,11 +17,13 @@ Features:
   - optional sound when a session starts waiting for you (toggle with the note)
   - collapse to a thin strip (chevron in the header)
   - right-click for a small menu
+  - one instance only, and laid out for the display's DPI
 
 Windows only (uses Win32 APIs via ctypes and ``winsound``).
 """
 import os
 import re
+import sys
 import json
 import time
 import threading
@@ -30,6 +32,90 @@ from ctypes import wintypes
 import winsound
 import tkinter as tk
 import tkinter.font as tkfont
+
+# ---------------------------------------------------------------------------
+# DPI. This has to happen before Tk starts, so it sits above everything else.
+# ---------------------------------------------------------------------------
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+_gdi32 = ctypes.windll.gdi32
+# A second handle to kernel32, opened so ctypes preserves GetLastError across
+# the call. Only the single-instance check needs it; ctypes.windll does not.
+_k32err = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+_gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+_gdi32.GetDeviceCaps.restype = ctypes.c_int
+
+LOGPIXELSY = 90
+
+
+def enable_dpi_awareness() -> None:
+    """Tell Windows we lay out in real pixels, before Tk reads the DPI.
+
+    Without this a display at 125% gets a widget laid out for 96 DPI and then
+    bitmap-stretched by Windows: blurry text in a box the wrong size. Tries
+    per-monitor v2 first and falls back through the older APIs for the Windows
+    versions that don't have it - each is simply absent rather than failing, so
+    a missing one raises AttributeError.
+    """
+    try:
+        _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        _user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if _user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # SYSTEM_DPI_AWARE
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        _user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+def dpi_scale() -> float:
+    """Real pixels this display draws per layout pixel.
+
+    ``CLAUDE_MONITOR_SCALE`` overrides it, both for a display where the
+    automatic value isn't the size you want the box to be and to exercise the
+    scaled layout on a machine that runs at 96 DPI.
+    """
+    override = os.environ.get("CLAUDE_MONITOR_SCALE")
+    if override:
+        try:
+            return max(0.5, min(4.0, float(override)))
+        except ValueError:
+            pass
+    try:
+        dc = _user32.GetDC(None)
+        if dc:
+            try:
+                dpi = _gdi32.GetDeviceCaps(dc, LOGPIXELSY)
+            finally:
+                _user32.ReleaseDC(None, dc)
+            if dpi > 0:
+                return max(1.0, dpi / 96.0)
+    except OSError:
+        pass
+    return 1.0
+
+
+enable_dpi_awareness()
+SCALE = dpi_scale()
+
+
+def px(value) -> int:
+    """A layout measurement in the real pixels of this display."""
+    return max(1, int(round(value * SCALE)))
+
 
 HOME = os.path.expanduser("~")
 # The override exists so a test can point the hook and the widget at a throwaway
@@ -52,19 +138,22 @@ DUP_DELETE_AFTER = 60   # a shadowed duplicate's file is deleted after N s
 STALE_AFTER = 120       # a status nothing refreshed for N s is shown as stale
 
 # --- Layout -----------------------------------------------------------------
-MARGIN = 14
-TASKBAR = 56            # approximate taskbar height (default placement only)
-DEFAULT_WIDTH = 250
-MIN_WIDTH = 170         # narrower than this and the status label owns the row
-MAX_WIDTH = 640
-GRIP_W = 5              # width of the drag-to-resize strip on the right edge
+# Everything here is in 96-DPI pixels and put through px(), so the box keeps its
+# proportions on a scaled display instead of growing text out of a fixed frame.
+MARGIN = px(14)
+HEADER_H = px(30)
+DEFAULT_WIDTH = px(250)
+MIN_WIDTH = px(170)     # narrower than this and the status label owns the row
+MAX_WIDTH = px(640)
+GRIP_W = px(5)          # width of the drag-to-resize strip on the right edge
 
 # Row paddings. Kept as constants because the name column is measured against
 # them to decide where to cut a too-long project name.
-ROW_PAD_LEFT = 10       # left of the status dot
-ROW_DOT_GAP = 8         # dot -> name
-ROW_NAME_GAP = 8        # name -> age -> status
-ROW_PAD_RIGHT = 12      # right of the status label
+ROW_PAD_LEFT = px(10)   # left of the status dot
+ROW_DOT_GAP = px(8)     # dot -> name
+ROW_NAME_GAP = px(8)    # name -> age -> status
+ROW_PAD_RIGHT = px(12)  # right of the status label
+ROW_PAD_Y = px(5)       # above and below a row
 ELLIPSIS = "…"
 EYE = "\U0001F441"      # header counter icon ("sessions watching you back")
 
@@ -182,8 +271,6 @@ def play_alert() -> None:
 # ---------------------------------------------------------------------------
 # Win32 helpers: find and focus the terminal/editor window of a session.
 # ---------------------------------------------------------------------------
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
 _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 # Anything returning a HANDLE or HWND needs an explicit restype: ctypes defaults
@@ -210,9 +297,18 @@ _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.BringWindowToTop.argtypes = [wintypes.HWND]
 _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT,
+                                          ctypes.c_void_p, wintypes.UINT]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
 
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
 SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+SPI_GETWORKAREA = 0x0030
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
 
 # Process names treated as a terminal/editor when matching a window by title.
 _TERM_PROC = {
@@ -234,6 +330,54 @@ def virtual_screen():
     g = _user32.GetSystemMetrics
     return (g(SM_XVIRTUALSCREEN), g(SM_YVIRTUALSCREEN),
             g(SM_CXVIRTUALSCREEN), g(SM_CYVIRTUALSCREEN))
+
+
+def work_area():
+    """Primary monitor minus the taskbar, as ``(left, top, right, bottom)``.
+
+    Replaces a hardcoded taskbar height, which was 8px out on the machine this
+    was written on and is wrong by a lot more whenever the taskbar is moved to
+    the side, auto-hidden, or drawn at a different scale.
+    """
+    rect = _RECT()
+    if _user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+        return rect.left, rect.top, rect.right, rect.bottom
+    return 0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+
+
+_instance_mutex = None
+MUTEX_NAME = "Local\\ClaudeSessionMonitor.Widget"
+
+
+def claim_single_instance() -> bool:
+    """False if another widget already holds the lock.
+
+    A named mutex rather than a pid file: Windows releases it however the
+    process dies, so a crash can never leave a stale lock that stops the widget
+    from starting again. ``Local\\`` scopes it to the logon session, so two
+    users sharing a machine get one widget each.
+
+    It matters more than it used to. Two widgets used to at least be visibly
+    two; now that the position is remembered they land exactly on top of each
+    other, so a Startup shortcut plus one impatient double-click looks like a
+    box that will not close.
+    """
+    global _instance_mutex
+    ERROR_ALREADY_EXISTS = 183
+    try:
+        _k32err.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                         wintypes.LPCWSTR]
+        _k32err.CreateMutexW.restype = wintypes.HANDLE
+        handle = _k32err.CreateMutexW(None, True, MUTEX_NAME)
+    except OSError:
+        return True                      # cannot tell -> let it run
+    if not handle:
+        return True
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        return False
+    _instance_mutex = handle             # held for the life of the process
+    return True
 
 
 def _proc_name(pid: int) -> str:
@@ -531,11 +675,11 @@ class Tip:
                 self.win.overrideredirect(True)
                 self.win.attributes("-topmost", True)
                 self.win.configure(bg=BORDER)
-                self.label = tk.Label(self.win, bg=BG_HEADER, fg=FG, padx=7,
-                                      pady=3, font=self.font, justify="left")
+                self.label = tk.Label(self.win, bg=BG_HEADER, fg=FG, padx=px(7),
+                                      pady=px(3), font=self.font, justify="left")
                 self.label.pack(padx=1, pady=1)
             self.label.config(text=text)
-            self.win.geometry(f"+{x + 12}+{y + 18}")
+            self.win.geometry(f"+{x + px(12)}+{y + px(18)}")
             self.win.deiconify()
         except tk.TclError:
             pass
@@ -584,6 +728,13 @@ class Monitor:
             pass
         root.configure(bg=BORDER)
 
+        # Tk sizes point-based fonts from its own scaling factor. Setting it
+        # from SCALE rather than leaving Tk to work it out keeps the text in
+        # step with the layout constants - and it belongs here, next to the
+        # fonts it governs, rather than in main(), where the two could drift
+        # apart for anyone building a Monitor directly.
+        root.tk.call("tk", "scaling", SCALE * 96.0 / 72.0)
+
         self.f_title = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         self.f_proj = tkfont.Font(family="Segoe UI", size=10)
         self.f_status = tkfont.Font(family="Segoe UI Semibold", size=9, weight="bold")
@@ -612,8 +763,9 @@ class Monitor:
 
     # ---------- Geometry ----------
     def _default_anchor(self):
-        """Bottom-left corner of the primary screen, above the taskbar."""
-        return MARGIN, self.root.winfo_screenheight() - TASKBAR - MARGIN
+        """Bottom-left corner of the primary monitor's work area."""
+        left, _top, _right, bottom = work_area()
+        return left + MARGIN, bottom - MARGIN
 
     def _load_anchor(self, cfg):
         """The saved bottom-left corner, or the default one.
@@ -673,18 +825,18 @@ class Monitor:
 
     # ---------- Header ----------
     def _build_header(self):
-        self.header = tk.Frame(self.outer, bg=BG_HEADER, height=30)
+        self.header = tk.Frame(self.outer, bg=BG_HEADER, height=HEADER_H)
         self.header.pack(fill="x")
         self.header.pack_propagate(False)
 
         self.chevron = tk.Label(self.header, text="▾", bg=BG_HEADER, fg=FG_DIM,
                                 font=self.f_title, cursor="hand2")
-        self.chevron.pack(side="left", padx=(8, 2))
+        self.chevron.pack(side="left", padx=(px(8), px(2)))
         self.chevron.bind("<Button-1>", lambda e: self.toggle_collapse())
 
         self.dot = tk.Label(self.header, text="●", bg=BG_HEADER, fg=ACCENT,
                             font=self.f_title)
-        self.dot.pack(side="left", padx=(2, 6))
+        self.dot.pack(side="left", padx=(px(2), px(6)))
 
         self.title = tk.Label(self.header, text="Claude Sessions", bg=BG_HEADER,
                               fg=FG, font=self.f_title)
@@ -692,7 +844,7 @@ class Monitor:
 
         self.close_btn = tk.Label(self.header, text="×", bg=BG_HEADER, fg=FG_DIM,
                                   font=self.f_title, cursor="hand2")
-        self.close_btn.pack(side="right", padx=(0, 10))
+        self.close_btn.pack(side="right", padx=(0, px(10)))
         self.close_btn.bind("<Button-1>", lambda e: self.root.destroy())
         self.close_btn.bind("<Enter>", lambda e: self.close_btn.config(fg="#f85149"))
         self.close_btn.bind("<Leave>", lambda e: self.close_btn.config(fg=FG_DIM))
@@ -700,7 +852,7 @@ class Monitor:
         # Sound toggle (a note; struck through = muted)
         self.sound_btn = tk.Label(self.header, text="♪", bg=BG_HEADER,
                                   font=self.f_icon, cursor="hand2")
-        self.sound_btn.pack(side="right", padx=(0, 8))
+        self.sound_btn.pack(side="right", padx=(0, px(8)))
         self.sound_btn.bind("<Button-1>", lambda e: self.toggle_sound())
         self._update_sound_btn()
 
@@ -708,7 +860,7 @@ class Monitor:
         # action) - a "working" count says nothing you have to act on.
         self.count_lbl = tk.Label(self.header, text="", bg=BG_HEADER, fg=FG_DIM,
                                   font=self.f_count)
-        self.count_lbl.pack(side="right", padx=(0, 8))
+        self.count_lbl.pack(side="right", padx=(0, px(8)))
 
         for w in (self.header, self.title, self.dot):
             w.bind("<Button-1>", self.start_drag)
@@ -869,7 +1021,8 @@ class Monitor:
 
         if not sessions:
             tk.Label(self.body, text="No active sessions", bg=BG, fg=FG_DIM,
-                     font=self.f_small, anchor="w", padx=12, pady=10).pack(fill="x")
+                     font=self.f_small, anchor="w",
+                     padx=px(12), pady=px(10)).pack(fill="x")
             return
 
         # Count duplicate project names to disambiguate them in the list.
@@ -884,7 +1037,7 @@ class Monitor:
             row.pack(fill="x")
 
             dot = tk.Label(row, text="●", bg=BG, fg=meta["color"], font=self.f_proj)
-            dot.pack(side="left", padx=(ROW_PAD_LEFT, ROW_DOT_GAP), pady=5)
+            dot.pack(side="left", padx=(ROW_PAD_LEFT, ROW_DOT_GAP), pady=ROW_PAD_Y)
             if meta.get("attn"):
                 self.action_dots.append((dot, meta["color"]))
 
@@ -1119,6 +1272,11 @@ class Monitor:
 
 
 def main():
+    if not claim_single_instance():
+        # No dialog: the widget that is already running is on screen, and this
+        # message is only reachable when someone runs the file from a console.
+        print("Claude Session Monitor is already running.", file=sys.stderr)
+        return
     root = tk.Tk()
     root.title("Claude Sessions")
     Monitor(root)
