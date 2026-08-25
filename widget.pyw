@@ -1,7 +1,7 @@
 #!/usr/bin/env pythonw
 """Floating always-on-top box that shows all running Claude Code sessions.
 
-Reads ``~/.claude/session-status/*.json`` (written by ``hook.py``) once per
+Reads ``~/.claude/session-status/*.json`` (written by ``hook.py``) twice a
 second and renders one row per session with a color-coded status:
 
     Permission (blue)  - Claude is blocked, waiting for you to approve a tool
