@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import threading
 import ctypes
@@ -650,6 +651,263 @@ def load_sessions():
     return out
 
 
+# ---------------------------------------------------------------------------
+# Notification-area ("system tray") icon.
+# ---------------------------------------------------------------------------
+_shell32 = ctypes.windll.shell32
+
+WM_APP = 0x8000
+TRAY_CALLBACK = WM_APP + 1
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
+WM_LBUTTONUP, WM_RBUTTONUP = 0x0202, 0x0205
+SM_CXSMICON = 49
+TRAY_CLASS = "ClaudeSessionMonitorTray"
+
+_LRESULT = ctypes.c_ssize_t
+_WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                ("szTip", ctypes.c_wchar * 128), ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD), ("szInfo", ctypes.c_wchar * 256),
+                ("uVersion", wintypes.UINT), ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", wintypes.DWORD), ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", wintypes.HICON)]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD)]
+
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD),
+                ("yHotspot", wintypes.DWORD), ("hbmMask", wintypes.HBITMAP),
+                ("hbmColor", wintypes.HBITMAP)]
+
+
+_user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+_user32.RegisterClassW.restype = wintypes.ATOM
+_user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+_user32.DefWindowProcW.restype = _LRESULT
+_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_user32.DestroyWindow.restype = wintypes.BOOL
+_user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+_user32.RegisterWindowMessageW.restype = wintypes.UINT
+_user32.CreateIconIndirect.argtypes = [ctypes.POINTER(_ICONINFO)]
+_user32.CreateIconIndirect.restype = wintypes.HICON
+_user32.DestroyIcon.argtypes = [wintypes.HICON]
+_user32.DestroyIcon.restype = wintypes.BOOL
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+_user32.GetCursorPos.restype = wintypes.BOOL
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+_gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC, ctypes.POINTER(_BITMAPINFOHEADER), wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+_gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+_gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT,
+                                wintypes.UINT, ctypes.c_void_p]
+_gdi32.CreateBitmap.restype = wintypes.HBITMAP
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+_shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                       ctypes.POINTER(_NOTIFYICONDATAW)]
+_shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+
+def make_dot_icon(color: str, size: int):
+    """A filled circle in ``color`` as an HICON, or ``None`` if GDI refuses.
+
+    Drawn by hand into a 32-bit DIB rather than shipped as .ico files: there is
+    one icon per status and the tray asks for a different size at every display
+    scale, so generating it is both less to carry and always the right size.
+    Coverage is computed per pixel so the edge stays smooth at 16px, and the
+    colour is premultiplied by it, which is what an alpha bitmap handed to
+    CreateIconIndirect has to be.
+    """
+    red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    centre = (size - 1) / 2.0
+    radius = size / 2.0 - 0.75
+    pixels = (ctypes.c_uint32 * (size * size))()
+    for y in range(size):
+        for x in range(size):
+            cov = radius + 0.5 - math.hypot(x - centre, y - centre)
+            cov = min(1.0, max(0.0, cov))
+            pixels[y * size + x] = ((int(255 * cov) << 24)
+                                    | (int(red * cov) << 16)
+                                    | (int(green * cov) << 8)
+                                    | int(blue * cov))
+
+    head = _BITMAPINFOHEADER()
+    head.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    head.biWidth = size
+    head.biHeight = -size            # negative = top-down, matching the loop
+    head.biPlanes = 1
+    head.biBitCount = 32
+    head.biCompression = 0           # BI_RGB
+    bits = ctypes.c_void_p()
+    colour_bmp = _gdi32.CreateDIBSection(None, ctypes.byref(head), 0,
+                                         ctypes.byref(bits), None, 0)
+    if not colour_bmp:
+        return None
+    ctypes.memmove(bits, pixels, ctypes.sizeof(pixels))
+
+    # An all-zero AND mask means "take every pixel from the colour bitmap", so
+    # the alpha channel above is what actually shapes the circle. Rows of a
+    # 1bpp bitmap are WORD-aligned.
+    mask_bytes = ((size + 15) // 16) * 2 * size
+    mask_bmp = _gdi32.CreateBitmap(size, size, 1, 1,
+                                   (ctypes.c_ubyte * mask_bytes)())
+    info = _ICONINFO(True, 0, 0, mask_bmp, colour_bmp)
+    icon = _user32.CreateIconIndirect(ctypes.byref(info))
+    _gdi32.DeleteObject(colour_bmp)
+    _gdi32.DeleteObject(mask_bmp)
+    return icon or None
+
+
+class Tray:
+    """A notification-area icon mirroring the aggregate status of the box.
+
+    Windows delivers tray clicks as window messages, so this owns a hidden
+    window to receive them. It deliberately does not run its own message loop:
+    Tk pumps the whole thread's message queue, so the callbacks arrive on the
+    Tk thread and can touch the widget directly, with no second thread and
+    nothing to lock.
+
+    Every failure is soft. A tray icon is a convenience, and a machine where
+    the shell refuses one should still get the floating box.
+    """
+
+    def __init__(self, monitor):
+        self.monitor = monitor
+        self.hwnd = None
+        self.icon = None
+        self.shown = False
+        self.state = None                       # last (color, tip) pushed
+        self.size = _user32.GetSystemMetrics(SM_CXSMICON) or px(16)
+        self._proc = _WNDPROC(self._wndproc)    # must outlive the window
+        # Explorer restarting takes every tray icon with it and then broadcasts
+        # this, which is the only chance to put ours back.
+        self._taskbar_created = _user32.RegisterWindowMessageW("TaskbarCreated")
+        try:
+            self._create_window()
+        except Exception:
+            self.hwnd = None
+
+    def _create_window(self):
+        module = _kernel32.GetModuleHandleW(None)
+        cls = _WNDCLASSW()
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = module
+        cls.lpszClassName = TRAY_CLASS
+        self._cls = cls                         # keep the class struct alive
+        _user32.RegisterClassW(ctypes.byref(cls))   # fails harmlessly if re-run
+        self.hwnd = _user32.CreateWindowExW(0, TRAY_CLASS, TRAY_CLASS, 0,
+                                            0, 0, 0, 0, None, None, module, None)
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        # A ctypes callback that raises prints a traceback and returns garbage,
+        # so nothing is allowed out of here.
+        try:
+            if msg == TRAY_CALLBACK:
+                event = lparam & 0xFFFF
+                if event == WM_LBUTTONUP:
+                    self.monitor.toggle_visible()
+                elif event == WM_RBUTTONUP:
+                    self.monitor.popup_menu_at_cursor()
+                return 0
+            if msg and msg == self._taskbar_created:
+                self.shown = False
+                self.state = None
+                self.monitor.refresh_tray()
+                return 0
+        except Exception:
+            pass
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _data(self, icon, tip):
+        data = _NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        data.hWnd = self.hwnd
+        data.uID = 1
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        data.uCallbackMessage = TRAY_CALLBACK
+        data.hIcon = icon
+        data.szTip = tip[:127]
+        return data
+
+    def update(self, color: str, tip: str) -> None:
+        """Add or re-colour the icon. Cheap to call on every refresh."""
+        if not self.hwnd or (color, tip) == self.state:
+            return
+        icon = make_dot_icon(color, self.size)
+        if not icon:
+            return
+        data = self._data(icon, tip)
+        action = NIM_MODIFY if self.shown else NIM_ADD
+        ok = _shell32.Shell_NotifyIconW(action, ctypes.byref(data))
+        if not ok:
+            # Our idea of whether the icon exists can be wrong in either
+            # direction - the shell may have dropped it (an Explorer restart we
+            # missed) or still hold it when we thought it was gone - and either
+            # way giving up here leaves a tray icon that never updates again.
+            other = NIM_ADD if action == NIM_MODIFY else NIM_MODIFY
+            ok = _shell32.Shell_NotifyIconW(other, ctypes.byref(data))
+        if not ok:
+            _user32.DestroyIcon(icon)
+            return
+        self.shown = True
+        self.state = (color, tip)
+        # Only now is the old icon certainly unused by the shell.
+        if self.icon:
+            _user32.DestroyIcon(self.icon)
+        self.icon = icon
+
+    def destroy(self) -> None:
+        """Take the icon out of the tray. Skipping this leaves a ghost behind."""
+        try:
+            if self.shown and self.hwnd:
+                data = _NOTIFYICONDATAW()
+                data.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+                data.hWnd = self.hwnd
+                data.uID = 1
+                _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(data))
+            self.shown = False
+            if self.icon:
+                _user32.DestroyIcon(self.icon)
+                self.icon = None
+            if self.hwnd:
+                _user32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+        except Exception:
+            pass
+
+
 class Tip:
     """One reusable tooltip window, shown for rows whose name was shortened."""
 
@@ -715,8 +973,11 @@ class Monitor:
         self.rows = []            # one dict per rendered row, see build_rows
         self.action_dots = []     # [(dot_label, color)] of attention rows to blink
 
+        self.counts = (0, 0, 0)   # permission, action, working - for the tray
+
         cfg = load_config()
         self.sound_on = bool(cfg.get("sound_on", True))
+        self.hidden = bool(cfg.get("hidden", False))
         self.width = clamp_width(cfg.get("width", DEFAULT_WIDTH))
         self.anchor = self._load_anchor(cfg)
 
@@ -756,8 +1017,11 @@ class Monitor:
         self.tip = Tip(root, self.f_small)
 
         self._build_menu()
+        self.tray = Tray(self)
 
         self.reposition()
+        if self.hidden:
+            root.withdraw()       # started in tray-only mode
         self.refresh()
         self.blink()
 
@@ -845,7 +1109,7 @@ class Monitor:
         self.close_btn = tk.Label(self.header, text="×", bg=BG_HEADER, fg=FG_DIM,
                                   font=self.f_title, cursor="hand2")
         self.close_btn.pack(side="right", padx=(0, px(10)))
-        self.close_btn.bind("<Button-1>", lambda e: self.root.destroy())
+        self.close_btn.bind("<Button-1>", lambda e: self.quit())
         self.close_btn.bind("<Enter>", lambda e: self.close_btn.config(fg="#f85149"))
         self.close_btn.bind("<Leave>", lambda e: self.close_btn.config(fg=FG_DIM))
 
@@ -889,11 +1153,13 @@ class Monitor:
         self.menu = tk.Menu(self.root, tearoff=0, bg=BG_HEADER, fg=FG,
                             activebackground="#1f6feb", activeforeground="#ffffff",
                             bd=0)
+        # Entry 0's label flips between Hide and Show, so it must stay first.
+        self.menu.add_command(label="Hide box", command=self.toggle_visible)
         self.menu.add_command(label="Clear finished", command=self.clear_done)
         self.menu.add_command(label="Reset position", command=self.reset_geometry)
         self.menu.add_command(label="Refresh", command=self.refresh)
         self.menu.add_separator()
-        self.menu.add_command(label="Close", command=self.root.destroy)
+        self.menu.add_command(label="Quit", command=self.quit)
         self.root.bind("<Button-3>", self.show_menu)
 
     # ---------- Dragging / resizing / menu ----------
@@ -928,10 +1194,65 @@ class Monitor:
         self.remember_geometry()
 
     def show_menu(self, e):
+        self._popup(e.x_root, e.y_root)
+
+    def _popup(self, x, y):
+        self.menu.entryconfigure(0, label="Show box" if self.hidden else "Hide box")
         try:
-            self.menu.tk_popup(e.x_root, e.y_root)
+            self.menu.tk_popup(x, y)
         finally:
             self.menu.grab_release()
+
+    # ---------- Tray ----------
+    def toggle_visible(self):
+        """Hide the box into the tray, or bring it back where it was."""
+        self.hidden = not self.hidden
+        if self.hidden:
+            self.tip.hide()
+            self.root.withdraw()
+        else:
+            self.root.deiconify()
+            self.reposition()
+        update_config(hidden=self.hidden)
+
+    def popup_menu_at_cursor(self):
+        """Open the menu at the mouse, for a right-click on the tray icon."""
+        point = wintypes.POINT()
+        if not _user32.GetCursorPos(ctypes.byref(point)):
+            return
+        # A popup menu only closes on an outside click while its owner is the
+        # foreground window, and the box may be hidden or unfocused - so the
+        # tray's own window takes the foreground first. Without this the menu
+        # can be left on screen with no way to dismiss it.
+        if self.tray.hwnd:
+            _user32.SetForegroundWindow(self.tray.hwnd)
+        self._popup(point.x, point.y)
+
+    def refresh_tray(self):
+        """Push the aggregate status of every session into the tray icon."""
+        n_perm, n_action, n_work = self.counts
+        if n_perm:
+            color = STATUS_META["permission"]["color"]
+        elif n_action:
+            color = STATUS_META["action"]["color"]
+        elif n_work:
+            color = STATUS_META["working"]["color"]
+        else:
+            color = FG_DIM
+        parts = []
+        if n_perm:
+            parts.append("%d need approval" % n_perm)
+        if n_action:
+            parts.append("%d waiting for you" % n_action)
+        if n_work:
+            parts.append("%d working" % n_work)
+        self.tray.update(color, "Claude Sessions - " +
+                         (", ".join(parts) if parts else "no active sessions"))
+
+    def quit(self):
+        """Shut down, taking the tray icon with us rather than leaving a ghost."""
+        self.tray.destroy()
+        self.root.destroy()
 
     # ---------- Collapse ----------
     def toggle_collapse(self):
@@ -1236,6 +1557,8 @@ class Monitor:
         n_action = sum(1 for s in sessions if s.get("status") == "action")
         n_work = sum(1 for s in sessions if s.get("status") == "working")
         self.has_action = (n_perm + n_action) > 0
+        self.counts = (n_perm, n_action, n_work)
+        self.refresh_tray()
         # header dot blink color - permission (blue) takes precedence
         self.attn_color = (STATUS_META["permission"]["color"] if n_perm
                            else STATUS_META["action"]["color"])
@@ -1279,8 +1602,14 @@ def main():
         return
     root = tk.Tk()
     root.title("Claude Sessions")
-    Monitor(root)
-    root.mainloop()
+    monitor = Monitor(root)
+    try:
+        root.mainloop()
+    finally:
+        # Quit() already did this; the finally is for every other way the loop
+        # can end, which would otherwise leave a dead icon in the tray until
+        # something makes the shell notice.
+        monitor.tray.destroy()
 
 
 if __name__ == "__main__":

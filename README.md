@@ -28,6 +28,9 @@ needed — and one click jumps you straight to that window.
   twice even when Claude Code changes a session's id mid-flight
 - **Unobtrusive** — frameless and collapsible to a thin strip; drag the header
   to move it and the right edge to resize it, and it remembers both
+- **Tray icon** — a coloured dot in the notification area showing the most
+  urgent status across every session; click it to hide or show the box, so you
+  can run in the tray alone
 - **One instance** — launching it again (Startup shortcut plus an impatient
   double-click) brings up nothing rather than a second box on top of the first
 - **Sharp on scaled displays** — laid out for the monitor's DPI instead of
@@ -153,8 +156,21 @@ scripts/start-monitor.ps1 finds Python, launches widget.pyw
   matter how long the project name is.
 - **`♪`** toggles the notification sound (struck through = muted).
 - **Chevron `▾/▸`** (or double-click the header) collapses the box to a strip.
-- **`×`** closes the widget. **Right-click** for a small menu, including
-  *Reset position* if you lose the box off the edge of a screen.
+- **`×`** quits. **Right-click** for a small menu, including *Reset position* if
+  you lose the box off the edge of a screen.
+
+### The tray icon
+
+A dot in the notification area takes the colour of the most urgent session —
+blue, amber, green, or grey when nothing is running — and its tooltip counts
+them. **Left-click** hides the box or brings it back; **right-click** opens the
+same menu as the box does, so *Reset position* and *Quit* are reachable even
+when the box is nowhere to be seen. Whether the box is hidden is remembered, so
+you can run in the tray alone.
+
+Windows 11 hides new tray icons behind the `^` chevron by default. Drag it out
+onto the taskbar, or use *Settings → Personalization → Taskbar → Other system
+tray icons*, to keep it visible.
 
 Position, width and the sound toggle are remembered in
 `~/.claude/session-monitor-config.json`. A saved position on a monitor that is
