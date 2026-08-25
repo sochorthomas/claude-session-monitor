@@ -129,7 +129,7 @@ if ($KeepData) {
 # --- Startup shortcut -------------------------------------------------------
 # Only ones pointing at this copy of start-monitor.vbs: leaving it behind would
 # bring the widget back at the next login, which is not what "uninstall" means.
-$vbs = Join-Path $PSScriptRoot "start-monitor.vbs"
+$vbs = Join-Path (Split-Path $PSScriptRoot -Parent) "start-monitor.vbs"
 $startup = [Environment]::GetFolderPath("Startup")
 $shell = New-Object -ComObject WScript.Shell
 $unlinked = 0

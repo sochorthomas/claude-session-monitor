@@ -10,7 +10,7 @@
 # script if you move or reinstall Python.
 $ErrorActionPreference = "Stop"
 
-$hook = Join-Path $PSScriptRoot "hook.py"
+$hook = Join-Path (Split-Path $PSScriptRoot -Parent) "hook.py"
 $settingsPath = Join-Path $env:USERPROFILE ".claude\settings.json"
 
 if (-not (Test-Path $hook)) {

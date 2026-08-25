@@ -8,7 +8,7 @@ rem the reason to run it at all.
 rem
 rem ASCII only - a .cmd is read in the console codepage.
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install.ps1"
 set "rc=%ERRORLEVEL%"
 echo.
 pause

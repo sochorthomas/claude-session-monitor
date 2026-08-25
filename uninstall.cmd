@@ -31,7 +31,7 @@ if "%flags%"=="#" (
     exit /b 1
 )
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall.ps1" %flags%
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\uninstall.ps1" %flags%
 set "rc=%ERRORLEVEL%"
 echo.
 pause

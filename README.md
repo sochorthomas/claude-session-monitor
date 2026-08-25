@@ -53,7 +53,7 @@ Then **double-click `install.cmd`**, or from a terminal:
 
 ```powershell
 cd claude-session-monitor
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
 Either way `install.ps1` registers the hooks in `~/.claude/settings.json`. It
@@ -140,8 +140,8 @@ exactly the rows you care about.
 
 ### Repository layout
 
-Everything you run yourself sits in the root and can be double-clicked;
-everything it calls lives beside it or in `scripts/`.
+The root holds what you double-click and the two programs themselves;
+everything the launchers call lives in `scripts/`.
 
 ```
 install.cmd               register the hooks (double-click this)
@@ -149,8 +149,8 @@ uninstall.cmd             remove everything again (double-click this)
 start-monitor.vbs         start the widget (double-click this)
 widget.pyw                the widget itself
 hook.py                   what Claude Code runs on every hook event
-install.ps1               what install.cmd runs
-uninstall.ps1             what uninstall.cmd runs
+scripts/install.ps1       what install.cmd runs
+scripts/uninstall.ps1     what uninstall.cmd runs
 scripts/start-monitor.ps1 finds Python, launches widget.pyw
 ```
 
@@ -202,7 +202,7 @@ size — it scales the text along with everything else.
 you to type `Y` (or `K` to keep your saved settings) — or from a terminal:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 ```
 
 Four steps, each reported as it happens:
