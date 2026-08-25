@@ -18,6 +18,7 @@ Features:
 Windows only (uses Win32 APIs via ctypes and ``winsound``).
 """
 import os
+import re
 import json
 import time
 import threading
@@ -29,19 +30,33 @@ import tkinter.font as tkfont
 
 HOME = os.path.expanduser("~")
 STATUS_DIR = os.path.join(HOME, ".claude", "session-status")
+PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 CONFIG_PATH = os.path.join(HOME, ".claude", "session-monitor-config.json")
 
 # --- Behavior ---------------------------------------------------------------
-REFRESH_MS = 1000       # how often to re-read the status files
+REFRESH_MS = 500        # how often to re-read the status files (a poll of the
+                        # status dir measures ~0.15 ms, so this is free and
+                        # halves how long a change waits to be shown)
 BLINK_MS = 650          # blink interval for attention states
 MAX_AGE_SEC = 24 * 3600  # drop sessions older than this (crash safety net)
 GRACE_NEW = 25          # don't clean up a session in its first N seconds
 MISSING_DWELL = 6       # a project window must be gone N s before we remove it
+GHOST_AFTER = 180       # a session with no transcript is an orphan after N s
+DUP_DELETE_AFTER = 60   # a shadowed duplicate's file is deleted after N s
 
 # --- Layout -----------------------------------------------------------------
 MARGIN = 14
 TASKBAR = 56            # approximate taskbar height (initial placement only)
 WIDTH = 250
+
+# Row paddings. Kept as constants because the name column is measured against
+# them to decide where to cut a too-long project name.
+ROW_PAD_LEFT = 10       # left of the status dot
+ROW_DOT_GAP = 8         # dot -> name
+ROW_NAME_GAP = 8        # name -> status label
+ROW_PAD_RIGHT = 12      # right of the status label
+ELLIPSIS = "…"
+EYE = "\U0001F441"      # header counter icon ("sessions watching you back")
 
 # --- Dark color scheme ------------------------------------------------------
 BG = "#0d1117"
@@ -55,12 +70,33 @@ ACCENT = "#58a6ff"
 # Status metadata. ``attn`` = needs the user -> blinks, plays a sound on entry,
 # and sorts to the top (lower ``prio`` = higher in the list).
 STATUS_META = {
-    "permission": {"label": "Permission", "color": "#58a6ff", "prio": 0, "attn": True},
-    "action":     {"label": "Action!",    "color": "#e3b341", "prio": 1, "attn": True},
+    "permission": {"label": "Permission!", "color": "#58a6ff", "prio": 0, "attn": True},
+    "action":     {"label": "Action!",     "color": "#e3b341", "prio": 1, "attn": True},
     "working":    {"label": "Working",     "color": "#3fb950", "prio": 2, "attn": False},
     "done":       {"label": "Done",        "color": "#6e7681", "prio": 3, "attn": False},
 }
 UNKNOWN = {"label": "?", "color": FG_DIM, "prio": 4, "attn": False}
+
+
+def fit_text(text: str, font, max_px: int) -> str:
+    """Shorten ``text`` to ``max_px`` pixels, ending with an ellipsis.
+
+    Tk labels have no text-overflow, so a long project name would otherwise be
+    clipped mid-letter at the window edge with no hint that anything is missing.
+    """
+    if max_px <= 0:
+        return ELLIPSIS
+    if font.measure(text) <= max_px:
+        return text
+    room = max_px - font.measure(ELLIPSIS)
+    if room <= 0:
+        return ELLIPSIS
+    kept = ""
+    for ch in text:
+        if font.measure(kept + ch) > room:
+            break
+        kept += ch
+    return kept.rstrip() + ELLIPSIS
 
 
 def load_config() -> dict:
@@ -96,6 +132,29 @@ def play_alert() -> None:
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+# Anything returning a HANDLE or HWND needs an explicit restype: ctypes defaults
+# to c_int and would truncate the upper 32 bits on 64-bit Windows. The values
+# Windows hands out are small enough that it works anyway, which is what makes
+# this worth pinning down rather than leaving to luck.
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.BringWindowToTop.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 
 # Process names treated as a terminal/editor when matching a window by title.
 _TERM_PROC = {
@@ -228,11 +287,118 @@ def open_editor_titles():
     return titles
 
 
+def remove_status(session_id) -> None:
+    """Delete one session's status file (it is gone or superseded)."""
+    try:
+        os.remove(os.path.join(STATUS_DIR, str(session_id) + ".json"))
+    except OSError:
+        pass
+
+
+def is_claude_pid(pid, cache=None) -> bool:
+    """True if ``pid`` is still a running Claude Code process.
+
+    The name is checked as well as mere existence, so a pid that Windows has
+    recycled onto an unrelated process doesn't keep a dead session alive.
+    """
+    if cache is None:
+        cache = {}
+    if pid not in cache:
+        cache[pid] = _proc_name(pid).lower()
+    return cache[pid].startswith("claude")
+
+
+_projects_cache = {"at": 0.0, "names": []}
+
+
+def _project_dirs():
+    """Cached listing of ``~/.claude/projects`` (one folder per project)."""
+    now = time.time()
+    if now - _projects_cache["at"] > 10:
+        try:
+            _projects_cache["names"] = os.listdir(PROJECTS_DIR)
+        except OSError:
+            _projects_cache["names"] = []
+        _projects_cache["at"] = now
+    return _projects_cache["names"]
+
+
+def has_transcript(rec) -> bool:
+    """True if this session has a transcript file on disk.
+
+    Claude Code writes ``<session_id>.jsonl`` as soon as a session has a real
+    turn, so a status file with no transcript belongs to a session id that was
+    announced and then abandoned. ``hook.py`` records ``transcript_path``; for
+    records written by an older hook we rebuild the path from ``cwd`` the way
+    Claude Code slugifies it (``c:\\xampp\\htdocs\\x`` -> ``c--xampp-htdocs-x``).
+    """
+    path = rec.get("transcript_path")
+    if path:
+        return os.path.exists(path)
+    cwd = rec.get("cwd") or ""
+    sid = rec.get("session_id") or ""
+    if not cwd or not sid:
+        return True                      # too little info -> never call it an orphan
+    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    for name in {slug, slug.lower()}:
+        if os.path.exists(os.path.join(PROJECTS_DIR, name, sid + ".jsonl")):
+            return True
+    low = slug.lower()
+    for name in _project_dirs():         # project folder cased differently
+        if name.lower() == low:
+            return os.path.exists(os.path.join(PROJECTS_DIR, name, sid + ".jsonl"))
+    return False
+
+
+def prune_orphans(records):
+    """Collapse the status files that produce duplicate rows for one window.
+
+    Two things leave a stale file behind, both without a ``SessionEnd``:
+
+    * Claude Code fires ``SessionStart`` under one session id and then runs the
+      conversation under a different one. The first id never receives another
+      hook and never gets a transcript.
+    * A session id is rotated mid-flight (resume/compact), leaving a stale file
+      that *does* have a transcript.
+
+    The stale file keeps the project name of a window that is still open, so the
+    window-title cleanup in ``Monitor.cleanup_closed`` can never catch it. These
+    two rules do: no transcript and no recent hook -> orphan; and one Claude
+    process runs one session, so per ``claude_pid`` only the most recently
+    updated record survives.
+    """
+    now = time.time()
+    live = []
+    for rec in records:
+        if now - rec.get("_updated", 0) > GHOST_AFTER and not has_transcript(rec):
+            remove_status(rec.get("session_id"))
+            continue
+        live.append(rec)
+
+    out = []
+    by_pid = {}
+    for rec in live:
+        pid = rec.get("claude_pid")
+        if isinstance(pid, int) and pid > 0:
+            by_pid.setdefault(pid, []).append(rec)
+        else:
+            out.append(rec)              # older hook.py -> no pid recorded
+    for group in by_pid.values():
+        group.sort(key=lambda r: r.get("_updated", 0), reverse=True)
+        out.append(group[0])
+        # Hide the shadowed ones immediately, but delete only once they have
+        # gone quiet, so we never race a session that is still writing.
+        for rec in group[1:]:
+            if now - rec.get("_updated", 0) > DUP_DELETE_AFTER:
+                remove_status(rec.get("session_id"))
+    return out
+
+
 def load_sessions():
     """Read all status files, dropping ones older than ``MAX_AGE_SEC``.
 
     Returns the records sorted by status priority (attention first) then by
-    most-recently-updated.
+    most-recently-updated, with orphaned duplicates already pruned.
     """
     out = []
     now = time.time()
@@ -259,12 +425,62 @@ def load_sessions():
         rec["_updated"] = updated
         out.append(rec)
 
+    out = prune_orphans(out)
+
     def key(r):
         st = STATUS_META.get(r.get("status"), UNKNOWN)
         return (st["prio"], -r.get("_updated", 0))
 
     out.sort(key=key)
     return out
+
+
+class Tip:
+    """One reusable tooltip window, shown for rows whose name was shortened."""
+
+    DELAY_MS = 400
+
+    def __init__(self, root, font):
+        self.root = root
+        self.font = font
+        self.win = None
+        self.label = None
+        self.timer = None
+
+    def schedule(self, text: str, x: int, y: int) -> None:
+        self.hide()
+        self.timer = self.root.after(self.DELAY_MS,
+                                     lambda: self._show(text, x, y))
+
+    def _show(self, text: str, x: int, y: int) -> None:
+        self.timer = None
+        try:
+            if self.win is None:
+                self.win = tk.Toplevel(self.root)
+                self.win.overrideredirect(True)
+                self.win.attributes("-topmost", True)
+                self.win.configure(bg=BORDER)
+                self.label = tk.Label(self.win, bg=BG_HEADER, fg=FG, padx=7,
+                                      pady=3, font=self.font, justify="left")
+                self.label.pack(padx=1, pady=1)
+            self.label.config(text=text)
+            self.win.geometry(f"+{x + 12}+{y + 18}")
+            self.win.deiconify()
+        except tk.TclError:
+            pass
+
+    def hide(self) -> None:
+        if self.timer is not None:
+            try:
+                self.root.after_cancel(self.timer)
+            except tk.TclError:
+                pass
+            self.timer = None
+        if self.win is not None:
+            try:
+                self.win.withdraw()
+            except tk.TclError:
+                pass
 
 
 class Monitor:
@@ -295,6 +511,7 @@ class Monitor:
         self.f_proj = tkfont.Font(family="Segoe UI", size=10)
         self.f_status = tkfont.Font(family="Segoe UI Semibold", size=9, weight="bold")
         self.f_small = tkfont.Font(family="Segoe UI", size=8)
+        self.f_count = tkfont.Font(family="Segoe UI", size=9)
         self.f_icon = tkfont.Font(family="Segoe UI", size=12)
 
         self.outer = tk.Frame(root, bg=BORDER)
@@ -304,6 +521,8 @@ class Monitor:
 
         self.body = tk.Frame(self.outer, bg=BG)
         self.body.pack(fill="both", expand=True)
+
+        self.tip = Tip(root, self.f_small)
 
         self._build_menu()
 
@@ -344,8 +563,10 @@ class Monitor:
         self.sound_btn.bind("<Button-1>", lambda e: self.toggle_sound())
         self._update_sound_btn()
 
+        # Counts only the sessions that are waiting for you (permission +
+        # action) - a "working" count says nothing you have to act on.
         self.count_lbl = tk.Label(self.header, text="", bg=BG_HEADER, fg=FG_DIM,
-                                  font=self.f_small)
+                                  font=self.f_count)
         self.count_lbl.pack(side="right", padx=(0, 8))
 
         for w in (self.header, self.title, self.dot):
@@ -437,6 +658,7 @@ class Monitor:
 
     # ---------- Row click -> focus that session's window ----------
     def on_row_click(self, ancestors, project):
+        self.tip.hide()
         if not focus_session(ancestors, project):
             # nothing to switch to - briefly flash the title as feedback
             self.title.config(fg="#f85149")
@@ -449,11 +671,21 @@ class Monitor:
             except tk.TclError:
                 pass
 
+    def _enter(self, cells, tip_text, event):
+        self._hover(cells, BG_HOVER)
+        if tip_text:
+            self.tip.schedule(tip_text, event.x_root, event.y_root)
+
+    def _leave(self, cells):
+        self._hover(cells, BG)
+        self.tip.hide()
+
     # ---------- Rendering ----------
     def build_rows(self, sessions):
         for w in self.body.winfo_children():
             w.destroy()
         self.action_dots = []
+        self.tip.hide()   # the widget it was anchored to is gone
 
         if not sessions:
             tk.Label(self.body, text="No active sessions", bg=BG, fg=FG_DIM,
@@ -465,6 +697,7 @@ class Monitor:
         for s in sessions:
             seen[s["project"]] = seen.get(s["project"], 0) + 1
 
+        pending = []
         for s in sessions:
             meta = STATUS_META.get(s.get("status"), UNKNOWN)
             ancestors = s.get("ancestors") or []
@@ -473,41 +706,103 @@ class Monitor:
             row.pack(fill="x")
 
             dot = tk.Label(row, text="●", bg=BG, fg=meta["color"], font=self.f_proj)
-            dot.pack(side="left", padx=(10, 8), pady=5)
+            dot.pack(side="left", padx=(ROW_PAD_LEFT, ROW_DOT_GAP), pady=5)
             if meta.get("attn"):
                 self.action_dots.append((dot, meta["color"]))
 
             name = s["project"]
             if seen.get(name, 0) > 1:
                 name = f"{name} #{s['session_id'][-4:]}"
-            proj = tk.Label(row, text=name, bg=BG, fg=FG, font=self.f_proj, anchor="w")
-            proj.pack(side="left", fill="x", expand=True)
 
+            # The status label is packed first so pack reserves its full width;
+            # the name then expands into whatever is left. Packed the other way
+            # round the expanding name takes the cavity first and the status
+            # label is squeezed below its requested width, which silently clips
+            # its text ("Permission" -> a few letters) on long project names.
             status = tk.Label(row, text=meta["label"], bg=BG, fg=meta["color"],
                               font=self.f_status, anchor="e")
-            status.pack(side="right", padx=(8, 12))
+            status.pack(side="right", padx=(ROW_NAME_GAP, ROW_PAD_RIGHT))
+
+            proj = tk.Label(row, text=name, bg=BG, fg=FG, font=self.f_proj,
+                            anchor="w")
+            proj.pack(side="left", fill="x", expand=True)
+
+            pending.append((row, dot, proj, status, name, s["project"], ancestors))
+
+        # Shorten the names only once every row is built: the space left for the
+        # name column is derived from the widgets' own requested widths, which
+        # include each label's border and padding. Estimating it from
+        # ``font.measure`` alone is a few pixels too generous - and the pixels
+        # Tk then clips are exactly the trailing ellipsis.
+        self.body.update_idletasks()
+        for row, dot, proj, status, name, project, ancestors in pending:
+            shown = fit_text(name, self.f_proj, self._name_room(row, dot, proj,
+                                                               status, name))
+            if shown != name:
+                proj.config(text=shown)
 
             cells = (row, dot, proj, status)
-            pname = s["project"]
+            # Only shortened names get a tooltip - that is the one case where
+            # the row doesn't already tell you everything.
+            tip = name if shown != name else ""
             for w in cells:
                 w.bind("<Button-1>",
-                       lambda e, a=ancestors, p=pname: self.on_row_click(a, p))
-                w.bind("<Enter>", lambda e, c=cells: self._hover(c, BG_HOVER))
-                w.bind("<Leave>", lambda e, c=cells: self._hover(c, BG))
+                       lambda e, a=ancestors, p=project: self.on_row_click(a, p))
+                w.bind("<Enter>", lambda e, c=cells, t=tip: self._enter(c, t, e))
+                w.bind("<Leave>", lambda e, c=cells: self._leave(c))
+
+    def _name_room(self, row, dot, proj, status, name) -> int:
+        """Pixels the name label can actually draw text in.
+
+        ``winfo_reqwidth`` of a label is its text plus its own border/padding,
+        so the difference from the measured text is the label's chrome. Working
+        from requested widths (rather than the allocated ``winfo_width``) keeps
+        this correct even on the first build, before the window is mapped and
+        has real geometry.
+        """
+        outer = row.winfo_width()
+        if outer <= 1:
+            outer = WIDTH - 2                      # not mapped yet
+        chrome = max(0, proj.winfo_reqwidth() - self.f_proj.measure(name))
+        return (outer - ROW_PAD_LEFT - dot.winfo_reqwidth() - ROW_DOT_GAP
+                - ROW_NAME_GAP - status.winfo_reqwidth() - ROW_PAD_RIGHT
+                - chrome)
 
     def cleanup_closed(self, sessions):
-        """Drop sessions whose terminal/editor window is no longer open."""
-        titles = open_editor_titles()
-        if not titles:
-            # could not enumerate windows -> don't remove anything
-            return sessions
+        """Drop sessions that are no longer running.
+
+        A recorded ``claude_pid`` is authoritative: if that process is gone the
+        session is over, even though ``SessionEnd`` never ran (hard window
+        close). Records without a pid (written by an older ``hook.py``) fall
+        back to matching the project name against open editor window titles,
+        which needs the ``MISSING_DWELL`` delay because a window can briefly
+        drop its title while reloading.
+        """
         now = time.time()
         alive = []
+        titles = None
+        name_cache = {}
         for s in sessions:
+            sid = s["session_id"]
+            recent = (now - s.get("_updated", 0)) < GRACE_NEW
+            pid = s.get("claude_pid")
+
+            if isinstance(pid, int) and pid > 0:
+                if recent or is_claude_pid(pid, name_cache):
+                    alive.append(s)
+                else:
+                    remove_status(sid)
+                self.missing_since.pop(sid, None)
+                continue
+
+            if titles is None:
+                titles = open_editor_titles()
+            if not titles:
+                # could not enumerate windows -> don't remove anything
+                alive.append(s)
+                continue
             proj = (s.get("project") or "").lower()
             present = bool(proj) and any(proj in t for t in titles)
-            recent = (now - s.get("_updated", 0)) < GRACE_NEW
-            sid = s["session_id"]
             if present or recent:
                 self.missing_since.pop(sid, None)
                 alive.append(s)
@@ -518,10 +813,7 @@ class Monitor:
                 self.missing_since[sid] = now
                 alive.append(s)
             elif now - first >= MISSING_DWELL:
-                try:
-                    os.remove(os.path.join(STATUS_DIR, sid + ".json"))
-                except OSError:
-                    pass
+                remove_status(sid)
                 self.missing_since.pop(sid, None)
             else:
                 alive.append(s)
@@ -553,20 +845,18 @@ class Monitor:
                            else STATUS_META["action"]["color"])
 
         # Only rebuild rows when the set of (session, status) actually changes.
-        signature = tuple((s["session_id"], s.get("status")) for s in sessions)
+        # Keyed on claude_pid where known, so a session id rotating under one
+        # window doesn't churn the rows.
+        signature = tuple((s.get("claude_pid") or s["session_id"], s.get("status"))
+                          for s in sessions)
         if signature != self.last_signature:
             self.last_signature = signature
             self.build_rows(sessions)
             self.reposition()
 
-        parts = []
-        if n_work:
-            parts.append(f"{n_work} ▶")
-        if n_action:
-            parts.append(f"{n_action} ⚠")
-        if n_perm:
-            parts.append(f"{n_perm} ●")
-        self.count_lbl.config(text="  ".join(parts))
+        n_attn = n_perm + n_action
+        self.count_lbl.config(text=f"{n_attn} {EYE}" if n_attn else "",
+                              fg=self.attn_color if n_attn else FG_DIM)
 
         if not self.has_action:
             self.dot.config(fg=STATUS_META["working"]["color"] if n_work else ACCENT)

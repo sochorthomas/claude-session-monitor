@@ -1,35 +1,58 @@
 # install.ps1 - register Claude Session Monitor hooks in ~/.claude/settings.json
 #
-# Adds the hook entries Claude Code needs to report each session's status to the
-# widget. Existing settings (and unrelated hooks) are preserved. Safe to re-run.
+# Only this tool's own hook entries are touched. Other settings, other hook
+# events, and your own entries on the same events are all preserved. Safe to
+# re-run: previous entries of ours are replaced, not duplicated.
 #
-# Note: Windows PowerShell's ConvertTo-Json unwraps single-element arrays, which
-# would produce the wrong hook shape. We therefore serialize the surrounding
-# settings normally but inject each event's hook array as pre-built JSON.
+# The interpreter path is resolved now and baked into the hook command, so each
+# hook is a single process (Claude Code's shell -> python) instead of spawning
+# another PowerShell to go looking for Python on every tool call. Re-run this
+# script if you move or reinstall Python.
 $ErrorActionPreference = "Stop"
 
-$wrapper = Join-Path $PSScriptRoot "hook-wrapper.ps1"
+$hook = Join-Path $PSScriptRoot "hook.py"
 $settingsPath = Join-Path $env:USERPROFILE ".claude\settings.json"
 
-function New-HookArrayJson([string]$status, [string]$matcher) {
-    $raw = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$wrapper`" $status"
-    $esc = $raw.Replace('\', '\\').Replace('"', '\"')
-    $inner = "{`"type`":`"command`",`"command`":`"$esc`"}"
-    if ($matcher) {
-        return "[{`"matcher`":`"$matcher`",`"hooks`":[$inner]}]"
-    }
-    return "[{`"hooks`":[$inner]}]"
+if (-not (Test-Path $hook)) {
+    throw "hook.py not found next to install.ps1 (looked for $hook)"
 }
 
-# Event -> (status, matcher). See README "How it works".
+# pythonw runs without a console window; python is the fallback.
+$python = (Get-Command pythonw -ErrorAction SilentlyContinue).Source
+if (-not $python) { $python = (Get-Command python -ErrorAction SilentlyContinue).Source }
+if (-not $python) {
+    throw "Python not found on PATH. Install Python 3.8+ and re-run this script."
+}
+
+# Matches our entries in settings.json - both the direct form written below and
+# the hook-wrapper.ps1 indirection used by older versions, so re-running or
+# uninstalling cleans those up too.
+$OURS = "hook-wrapper\.ps1|hook\.py"
+
+# Event -> (status, matcher). See README "How it works". "notify" is resolved to
+# permission or action by hook.py, from the notification message.
 $events = [ordered]@{
     SessionStart      = @{ status = "action";     matcher = $null }
     UserPromptSubmit  = @{ status = "working";    matcher = $null }
     PostToolUse       = @{ status = "working";    matcher = "*"  }
     PermissionRequest = @{ status = "permission"; matcher = "*"  }
-    Notification      = @{ status = "permission"; matcher = $null }
+    Notification      = @{ status = "notify";     matcher = $null }
     Stop              = @{ status = "action";     matcher = $null }
     SessionEnd        = @{ status = "end";        matcher = $null }
+}
+
+function New-HookGroup([string]$status, [string]$matcher) {
+    # -E -s keeps a stray PYTHONPATH / user site-packages from breaking the hook.
+    $cmd = "`"$python`" -E -s `"$hook`" $status"
+    $entry = [PSCustomObject]@{ type = "command"; command = $cmd }
+    if ($matcher) {
+        return [PSCustomObject]@{ matcher = $matcher; hooks = @($entry) }
+    }
+    return [PSCustomObject]@{ hooks = @($entry) }
+}
+
+function Test-OurGroup($group) {
+    return (ConvertTo-Json -InputObject $group -Depth 20 -Compress) -match $OURS
 }
 
 if (Test-Path $settingsPath) {
@@ -43,22 +66,30 @@ if (Test-Path $settingsPath) {
     $settings = [PSCustomObject]@{}
 }
 
-# Put unique placeholders in for each event, serialize, then swap the
-# placeholders for real hook arrays (guarantees array shape).
-$placeholders = [ordered]@{}
-foreach ($e in $events.Keys) { $placeholders[$e] = "@@$e@@" }
-$settings | Add-Member -NotePropertyName hooks -NotePropertyValue $placeholders -Force
+if (-not ($settings.PSObject.Properties.Name -contains "hooks")) {
+    $settings | Add-Member -NotePropertyName hooks -NotePropertyValue ([PSCustomObject]@{}) -Force
+}
+$hooks = $settings.hooks
 
-$json = $settings | ConvertTo-Json -Depth 20
-foreach ($e in $events.Keys) {
-    $arr = New-HookArrayJson $events[$e].status $events[$e].matcher
-    $json = $json.Replace("`"@@$e@@`"", $arr)
+foreach ($evt in $events.Keys) {
+    # Keep every foreign group on this event, drop our own from a previous run.
+    $keep = @()
+    if ($hooks.PSObject.Properties.Name -contains $evt) {
+        $keep = @($hooks.$evt) | Where-Object { $_ -and -not (Test-OurGroup $_) }
+    }
+    $group = New-HookGroup $events[$evt].status $events[$evt].matcher
+    $hooks | Add-Member -NotePropertyName $evt -NotePropertyValue (@($keep) + @($group)) -Force
 }
 
+# Serialize the whole document at once. Piping an array into ConvertTo-Json
+# unwraps a single-element one, but arrays nested inside an object survive - so
+# the hook arrays keep their shape as long as we never pipe them on their own.
+$json = ConvertTo-Json -InputObject $settings -Depth 20
 [IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "Installed hooks into $settingsPath" -ForegroundColor Green
-Write-Host "Wrapper: $wrapper"
+Write-Host "Interpreter: $python"
+Write-Host "Hook:        $hook"
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1) Reload Claude Code so it picks up the hooks"

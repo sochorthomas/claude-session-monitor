@@ -3,11 +3,12 @@
 ' to launch it at login.
 '
 ' This file must stay ASCII-only (WScript reads .vbs as ANSI). It only locates
-' start-monitor.ps1 next to itself and runs it hidden; all path handling lives
-' in the .ps1, so the tool works from any location, including paths with spaces.
+' scripts\start-monitor.ps1 below itself and runs it hidden; all path handling
+' lives in the .ps1, so the tool works from any location, including paths with
+' spaces.
 Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
-ps1 = fso.BuildPath(scriptDir, "start-monitor.ps1")
+ps1 = fso.BuildPath(fso.BuildPath(scriptDir, "scripts"), "start-monitor.ps1")
 
 q = Chr(34)
 Set sh = CreateObject("WScript.Shell")
