@@ -10,6 +10,9 @@ second and renders one row per session with a color-coded status:
 
 Features:
   - frameless, always-on-top, draggable by the header
+  - remembers where you put it and how wide you made it
+  - drag the right edge to change the width
+  - a stale status (one nothing has refreshed for a while) is dimmed and dated
   - click a row to bring that session's terminal/editor window to the front
   - optional sound when a session starts waiting for you (toggle with the note)
   - collapse to a thin strip (chevron in the header)
@@ -29,7 +32,10 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 HOME = os.path.expanduser("~")
-STATUS_DIR = os.path.join(HOME, ".claude", "session-status")
+# The override exists so a test can point the hook and the widget at a throwaway
+# directory instead of the one a live session is writing to (see install.ps1).
+STATUS_DIR = (os.environ.get("CLAUDE_MONITOR_STATUS_DIR")
+              or os.path.join(HOME, ".claude", "session-status"))
 PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 CONFIG_PATH = os.path.join(HOME, ".claude", "session-monitor-config.json")
 
@@ -43,17 +49,21 @@ GRACE_NEW = 25          # don't clean up a session in its first N seconds
 MISSING_DWELL = 6       # a project window must be gone N s before we remove it
 GHOST_AFTER = 180       # a session with no transcript is an orphan after N s
 DUP_DELETE_AFTER = 60   # a shadowed duplicate's file is deleted after N s
+STALE_AFTER = 120       # a status nothing refreshed for N s is shown as stale
 
 # --- Layout -----------------------------------------------------------------
 MARGIN = 14
-TASKBAR = 56            # approximate taskbar height (initial placement only)
-WIDTH = 250
+TASKBAR = 56            # approximate taskbar height (default placement only)
+DEFAULT_WIDTH = 250
+MIN_WIDTH = 170         # narrower than this and the status label owns the row
+MAX_WIDTH = 640
+GRIP_W = 5              # width of the drag-to-resize strip on the right edge
 
 # Row paddings. Kept as constants because the name column is measured against
 # them to decide where to cut a too-long project name.
 ROW_PAD_LEFT = 10       # left of the status dot
 ROW_DOT_GAP = 8         # dot -> name
-ROW_NAME_GAP = 8        # name -> status label
+ROW_NAME_GAP = 8        # name -> age -> status
 ROW_PAD_RIGHT = 12      # right of the status label
 ELLIPSIS = "…"
 EYE = "\U0001F441"      # header counter icon ("sessions watching you back")
@@ -66,6 +76,7 @@ BORDER = "#30363d"
 FG = "#e6edf3"
 FG_DIM = "#8b949e"
 ACCENT = "#58a6ff"
+FADE = 0.55             # how far a stale row's colors are pulled toward BG
 
 # Status metadata. ``attn`` = needs the user -> blinks, plays a sound on entry,
 # and sorts to the top (lower ``prio`` = higher in the list).
@@ -76,6 +87,40 @@ STATUS_META = {
     "done":       {"label": "Done",        "color": "#6e7681", "prio": 3, "attn": False},
 }
 UNKNOWN = {"label": "?", "color": FG_DIM, "prio": 4, "attn": False}
+
+
+def blend(color: str, other: str, t: float) -> str:
+    """Mix two ``#rrggbb`` colors: ``t=0`` gives ``color``, ``t=1`` ``other``.
+
+    Tk has no per-widget opacity, so fading a row means computing the faded
+    color rather than turning anything translucent.
+    """
+    if t <= 0:
+        return color
+    a, b = int(color[1:], 16), int(other[1:], 16)
+    out = 0
+    for shift in (16, 8, 0):
+        ca, cb = (a >> shift) & 0xFF, (b >> shift) & 0xFF
+        out |= int(round(ca + (cb - ca) * t)) << shift
+    return "#%06x" % out
+
+
+def format_age(seconds: float) -> str:
+    """Compact age of a status that has not been refreshed: ``90s``, ``4m``, ``2h``."""
+    if seconds < 60:
+        return "%ds" % int(seconds)
+    if seconds < 3600:
+        return "%dm" % int(seconds // 60)
+    return "%dh" % int(seconds // 3600)
+
+
+def clamp_width(value) -> int:
+    """Coerce a stored or dragged width into the allowed range."""
+    try:
+        width = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WIDTH
+    return max(MIN_WIDTH, min(MAX_WIDTH, width))
 
 
 def fit_text(text: str, font, max_px: int) -> str:
@@ -107,7 +152,15 @@ def load_config() -> dict:
         return {}
 
 
-def save_config(cfg: dict) -> None:
+def update_config(**values) -> None:
+    """Merge ``values`` into the config file.
+
+    A plain overwrite would be enough for a single setting, but the sound
+    toggle, the position and the width are each saved from a different place -
+    and whichever wrote last would drop the other two.
+    """
+    cfg = load_config()
+    cfg.update(values)
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
@@ -146,6 +199,8 @@ _kernel32.QueryFullProcessImageNameW.argtypes = [
 ]
 _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 _user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_user32.GetSystemMetrics.restype = ctypes.c_int
 _user32.IsWindowVisible.argtypes = [wintypes.HWND]
 _user32.IsIconic.argtypes = [wintypes.HWND]
 _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
@@ -156,6 +211,9 @@ _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.BringWindowToTop.argtypes = [wintypes.HWND]
 _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+
 # Process names treated as a terminal/editor when matching a window by title.
 _TERM_PROC = {
     "code.exe", "code - insiders.exe", "windowsterminal.exe", "wt.exe",
@@ -163,6 +221,19 @@ _TERM_PROC = {
     "alacritty.exe", "wezterm-gui.exe", "hyper.exe", "cursor.exe",
     "windsurf.exe", "openconsole.exe",
 }
+
+
+def virtual_screen():
+    """Bounds of the whole desktop as ``(x, y, w, h)``.
+
+    Tk's ``winfo_screenwidth`` only knows the primary monitor, so it would call
+    a perfectly good saved position on a second screen out of bounds - and it
+    has no way at all to express the negative coordinates of a monitor placed
+    to the left of the primary one.
+    """
+    g = _user32.GetSystemMetrics
+    return (g(SM_XVIRTUALSCREEN), g(SM_YVIRTUALSCREEN),
+            g(SM_CXVIRTUALSCREEN), g(SM_CYVIRTUALSCREEN))
 
 
 def _proc_name(pid: int) -> str:
@@ -495,9 +566,15 @@ class Monitor:
         self.collapsed = False
         self.has_action = False
         self.attn_color = STATUS_META["action"]["color"]
-        self.sound_on = bool(load_config().get("sound_on", True))
-        self.drag = {"x": 0, "y": 0}
+        self.drag = (0, 0)
+        self.resizing = (0, DEFAULT_WIDTH)
+        self.rows = []            # one dict per rendered row, see build_rows
         self.action_dots = []     # [(dot_label, color)] of attention rows to blink
+
+        cfg = load_config()
+        self.sound_on = bool(cfg.get("sound_on", True))
+        self.width = clamp_width(cfg.get("width", DEFAULT_WIDTH))
+        self.anchor = self._load_anchor(cfg)
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -517,6 +594,9 @@ class Monitor:
         self.outer = tk.Frame(root, bg=BORDER)
         self.outer.pack(fill="both", expand=True, padx=1, pady=1)
 
+        # Packed before the header and body so it claims a full-height column
+        # on the right; pack fills the remaining cavity with everything else.
+        self._build_grip()
         self._build_header()
 
         self.body = tk.Frame(self.outer, bg=BG)
@@ -529,6 +609,67 @@ class Monitor:
         self.reposition()
         self.refresh()
         self.blink()
+
+    # ---------- Geometry ----------
+    def _default_anchor(self):
+        """Bottom-left corner of the primary screen, above the taskbar."""
+        return MARGIN, self.root.winfo_screenheight() - TASKBAR - MARGIN
+
+    def _load_anchor(self, cfg):
+        """The saved bottom-left corner, or the default one.
+
+        The *bottom*-left corner is what gets stored, because the box grows
+        upward: a new session adds its row above the bottom edge instead of
+        pushing the widget down off the screen and shifting the rows you were
+        already looking at.
+
+        A saved corner is only honoured if it is still on a connected monitor -
+        otherwise unplugging a second screen would leave the widget marooned
+        off-desktop with no way to drag it back.
+        """
+        try:
+            x, bottom = int(cfg["x"]), int(cfg["bottom"])
+        except (KeyError, TypeError, ValueError):
+            return self._default_anchor()
+        vx, vy, vw, vh = virtual_screen()
+        on_screen = (vw > 0 and vh > 0
+                     and vx <= x <= vx + vw - MIN_WIDTH
+                     and vy < bottom <= vy + vh)
+        return (x, bottom) if on_screen else self._default_anchor()
+
+    def reposition(self):
+        """Resize to fit the rows, keeping the remembered bottom-left corner.
+
+        Called after every rebuild, so it must not move the box. Pinning it back
+        to the screen corner here is what used to undo a drag the moment any
+        session changed status.
+        """
+        self.root.update_idletasks()
+        h = self.root.winfo_reqheight()
+        x, bottom = self.anchor
+        y = bottom - h
+        _vx, vy, _vw, vh = virtual_screen()
+        if vh > 0 and y < vy:
+            # Enough sessions to reach the top of the desktop: stop there rather
+            # than scrolling the header out of reach. The anchor is left alone,
+            # so the box drops back to it as soon as rows go away.
+            y = vy
+        self.root.geometry("%dx%d+%d+%d" % (self.width, h, x, y))
+
+    def remember_geometry(self):
+        """Persist the corner and width the user just dragged the box to."""
+        self.root.update_idletasks()
+        self.anchor = (self.root.winfo_x(),
+                       self.root.winfo_y() + self.root.winfo_height())
+        update_config(x=self.anchor[0], bottom=self.anchor[1], width=self.width)
+
+    def reset_geometry(self):
+        """Put the box back in its default corner at its default width."""
+        self.width = DEFAULT_WIDTH
+        self.anchor = self._default_anchor()
+        self.reposition()
+        self.fit_names()
+        update_config(x=self.anchor[0], bottom=self.anchor[1], width=self.width)
 
     # ---------- Header ----------
     def _build_header(self):
@@ -572,44 +713,73 @@ class Monitor:
         for w in (self.header, self.title, self.dot):
             w.bind("<Button-1>", self.start_drag)
             w.bind("<B1-Motion>", self.on_drag)
+            w.bind("<ButtonRelease-1>", self.end_drag)
             w.bind("<Double-Button-1>", lambda e: self.toggle_collapse())
+
+    def _build_grip(self):
+        """The drag-to-resize strip down the right edge.
+
+        Coloured like the border so it reads as part of the frame rather than as
+        an extra element, and lit up on hover so it is discoverable - a frameless
+        window gives Windows nothing to draw a resize edge on.
+        """
+        self.grip = tk.Frame(self.outer, bg=BORDER, width=GRIP_W,
+                             cursor="sb_h_double_arrow")
+        self.grip.pack(side="right", fill="y")
+        self.grip.pack_propagate(False)
+        self.grip.bind("<Button-1>", self.start_resize)
+        self.grip.bind("<B1-Motion>", self.on_resize)
+        self.grip.bind("<ButtonRelease-1>", self.end_resize)
+        self.grip.bind("<Enter>", lambda e: self.grip.config(bg=ACCENT))
+        self.grip.bind("<Leave>", lambda e: self.grip.config(bg=BORDER))
 
     def _build_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0, bg=BG_HEADER, fg=FG,
                             activebackground="#1f6feb", activeforeground="#ffffff",
                             bd=0)
         self.menu.add_command(label="Clear finished", command=self.clear_done)
+        self.menu.add_command(label="Reset position", command=self.reset_geometry)
         self.menu.add_command(label="Refresh", command=self.refresh)
         self.menu.add_separator()
         self.menu.add_command(label="Close", command=self.root.destroy)
         self.root.bind("<Button-3>", self.show_menu)
 
-    # ---------- Dragging / menu ----------
+    # ---------- Dragging / resizing / menu ----------
     def start_drag(self, e):
-        self.drag["x"] = e.x
-        self.drag["y"] = e.y
+        # Store the grab point relative to the window, so the cursor keeps
+        # holding the same spot however far the pointer travels in one motion.
+        self.drag = (e.x_root - self.root.winfo_x(),
+                     e.y_root - self.root.winfo_y())
 
     def on_drag(self, e):
-        x = self.root.winfo_x() + (e.x - self.drag["x"])
-        y = self.root.winfo_y() + (e.y - self.drag["y"])
-        self.root.geometry(f"+{x}+{y}")
+        dx, dy = self.drag
+        self.root.geometry("+%d+%d" % (e.x_root - dx, e.y_root - dy))
+
+    def end_drag(self, _e=None):
+        self.remember_geometry()
+
+    def start_resize(self, e):
+        self.resizing = (e.x_root, self.width)
+
+    def on_resize(self, e):
+        x0, w0 = self.resizing
+        width = clamp_width(w0 + (e.x_root - x0))
+        if width == self.width:
+            return
+        self.width = width
+        # Only the right edge moves: the anchor is the *left* corner, so the box
+        # grows away from the screen edge it is usually parked against.
+        self.reposition()
+        self.fit_names()
+
+    def end_resize(self, _e=None):
+        self.remember_geometry()
 
     def show_menu(self, e):
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
             self.menu.grab_release()
-
-    def reposition(self):
-        """Size to content (fixed width) and pin to the bottom-left corner."""
-        self.root.update_idletasks()
-        h = self.root.winfo_reqheight()
-        sh = self.root.winfo_screenheight()
-        x = MARGIN
-        y = sh - h - TASKBAR - MARGIN
-        if y < MARGIN:
-            y = MARGIN
-        self.root.geometry(f"{WIDTH}x{h}+{x}+{y}")
 
     # ---------- Collapse ----------
     def toggle_collapse(self):
@@ -630,7 +800,7 @@ class Monitor:
 
     def toggle_sound(self):
         self.sound_on = not self.sound_on
-        save_config({"sound_on": self.sound_on})
+        update_config(sound_on=self.sound_on)
         self._update_sound_btn()
         if self.sound_on:
             play_alert()   # short preview that sound is on
@@ -681,10 +851,20 @@ class Monitor:
         self.tip.hide()
 
     # ---------- Rendering ----------
+    @staticmethod
+    def row_key(s):
+        """Identity of a row: the Claude process, or the session id without one.
+
+        Keyed on the process so a session id rotating under one window updates
+        the row it already has instead of churning the whole list.
+        """
+        return s.get("claude_pid") or s["session_id"]
+
     def build_rows(self, sessions):
         for w in self.body.winfo_children():
             w.destroy()
         self.action_dots = []
+        self.rows = []
         self.tip.hide()   # the widget it was anchored to is gone
 
         if not sessions:
@@ -697,10 +877,8 @@ class Monitor:
         for s in sessions:
             seen[s["project"]] = seen.get(s["project"], 0) + 1
 
-        pending = []
         for s in sessions:
             meta = STATUS_META.get(s.get("status"), UNKNOWN)
-            ancestors = s.get("ancestors") or []
 
             row = tk.Frame(self.body, bg=BG, cursor="hand2")
             row.pack(fill="x")
@@ -723,50 +901,115 @@ class Monitor:
                               font=self.f_status, anchor="e")
             status.pack(side="right", padx=(ROW_NAME_GAP, ROW_PAD_RIGHT))
 
+            # Packed only while it has text (see update_ages), so a fresh row
+            # keeps exactly the spacing it had before there was an age column.
+            age = tk.Label(row, text="", bg=BG, fg=FG_DIM, font=self.f_small,
+                           anchor="e")
+
             proj = tk.Label(row, text=name, bg=BG, fg=FG, font=self.f_proj,
                             anchor="w")
             proj.pack(side="left", fill="x", expand=True)
 
-            pending.append((row, dot, proj, status, name, s["project"], ancestors))
+            item = {"key": self.row_key(s), "frame": row, "dot": dot,
+                    "proj": proj, "status": status, "age": age, "name": name,
+                    "meta": meta, "tip": "", "age_text": "", "stale": False}
+            self.rows.append(item)
 
-        # Shorten the names only once every row is built: the space left for the
-        # name column is derived from the widgets' own requested widths, which
-        # include each label's border and padding. Estimating it from
-        # ``font.measure`` alone is a few pixels too generous - and the pixels
-        # Tk then clips are exactly the trailing ellipsis.
-        self.body.update_idletasks()
-        for row, dot, proj, status, name, project, ancestors in pending:
-            shown = fit_text(name, self.f_proj, self._name_room(row, dot, proj,
-                                                               status, name))
-            if shown != name:
-                proj.config(text=shown)
-
-            cells = (row, dot, proj, status)
-            # Only shortened names get a tooltip - that is the one case where
-            # the row doesn't already tell you everything.
-            tip = name if shown != name else ""
+            cells = (row, dot, proj, status, age)
             for w in cells:
                 w.bind("<Button-1>",
-                       lambda e, a=ancestors, p=project: self.on_row_click(a, p))
-                w.bind("<Enter>", lambda e, c=cells, t=tip: self._enter(c, t, e))
+                       lambda e, a=s.get("ancestors") or [], p=s["project"]:
+                       self.on_row_click(a, p))
+                # The tooltip is read from the row at event time, not captured:
+                # resizing the box changes which names are shortened.
+                w.bind("<Enter>",
+                       lambda e, c=cells, it=item: self._enter(c, it["tip"], e))
                 w.bind("<Leave>", lambda e, c=cells: self._leave(c))
 
-    def _name_room(self, row, dot, proj, status, name) -> int:
+        self.fit_names()
+
+    def fit_names(self):
+        """Shorten the project names to the room the rows currently have.
+
+        Separate from ``build_rows`` because dragging the resize grip, and an
+        age chip appearing, both change the room without changing the rows.
+        """
+        for item in self.rows:
+            shown = fit_text(item["name"], self.f_proj, self._name_room(item))
+            if item["proj"].cget("text") != shown:
+                item["proj"].config(text=shown)
+            # Only a shortened name gets a tooltip - that is the one case where
+            # the row doesn't already tell you everything.
+            item["tip"] = item["name"] if shown != item["name"] else ""
+
+    def _name_room(self, item) -> int:
         """Pixels the name label can actually draw text in.
 
-        ``winfo_reqwidth`` of a label is its text plus its own border/padding,
-        so the difference from the measured text is the label's chrome. Working
-        from requested widths (rather than the allocated ``winfo_width``) keeps
-        this correct even on the first build, before the window is mapped and
-        has real geometry.
+        The row width is derived from ``self.width`` rather than read back with
+        ``winfo_width``: during a resize drag Tk has not applied the new
+        geometry yet, so asking it would fit every name to the previous width.
+        ``winfo_reqwidth`` of a label, on the other hand, is its text plus its
+        own border and padding, so the difference from the measured text is the
+        chrome that has to come off the budget too.
         """
-        outer = row.winfo_width()
-        if outer <= 1:
-            outer = WIDTH - 2                      # not mapped yet
-        chrome = max(0, proj.winfo_reqwidth() - self.f_proj.measure(name))
-        return (outer - ROW_PAD_LEFT - dot.winfo_reqwidth() - ROW_DOT_GAP
-                - ROW_NAME_GAP - status.winfo_reqwidth() - ROW_PAD_RIGHT
-                - chrome)
+        proj, age = item["proj"], item["age"]
+        outer = self.width - 2 - GRIP_W          # 1px window border either side
+        chrome = max(0, proj.winfo_reqwidth() - self.f_proj.measure(proj.cget("text")))
+        taken = (ROW_PAD_LEFT + item["dot"].winfo_reqwidth() + ROW_DOT_GAP
+                 + ROW_NAME_GAP + item["status"].winfo_reqwidth() + ROW_PAD_RIGHT
+                 + chrome)
+        if item["age_text"]:
+            taken += age.winfo_reqwidth() + ROW_NAME_GAP
+        return outer - taken
+
+    def update_ages(self, sessions):
+        """Show how stale each row is, in place.
+
+        A row is only *stale* if nothing is expected to refresh it: "Action!"
+        and "Permission!" are states a session sits in on purpose while it waits
+        for you, so ageing those would dim exactly the rows that matter. A green
+        "Working" that has not been touched for minutes is the interesting case
+        - either a long tool call, or a session whose hooks have quietly stopped
+        arriving, and until now the widget showed both as freshly working.
+
+        Done in place rather than by rebuilding the rows: nothing about the list
+        has changed except its age, and a rebuild twice a second would flicker
+        and keep dropping the tooltip.
+        """
+        now = time.time()
+        by_key = {self.row_key(s): s for s in sessions}
+        refit = False
+        for item in self.rows:
+            s = by_key.get(item["key"])
+            if s is None:
+                continue
+            age = now - s.get("_updated", now)
+            stale = (not item["meta"].get("attn")) and age >= STALE_AFTER
+            text = format_age(age) if stale else ""
+
+            if text != item["age_text"]:
+                item["age_text"] = text
+                item["age"].config(text=text)
+                if text:
+                    item["age"].pack(side="right", after=item["status"],
+                                     padx=(ROW_NAME_GAP, 0))
+                else:
+                    item["age"].pack_forget()
+                refit = True
+            if stale != item["stale"]:
+                item["stale"] = stale
+                self._paint(item)
+        if refit:
+            self.fit_names()
+
+    def _paint(self, item):
+        """Recolor a row for its current staleness."""
+        t = FADE if item["stale"] else 0.0
+        color = item["meta"]["color"]
+        item["dot"].config(fg=blend(color, BG, t))
+        item["status"].config(fg=blend(color, BG, t))
+        item["proj"].config(fg=blend(FG, BG, t))
+        item["age"].config(fg=blend(FG_DIM, BG, t))
 
     def cleanup_closed(self, sessions):
         """Drop sessions that are no longer running.
@@ -845,14 +1088,13 @@ class Monitor:
                            else STATUS_META["action"]["color"])
 
         # Only rebuild rows when the set of (session, status) actually changes.
-        # Keyed on claude_pid where known, so a session id rotating under one
-        # window doesn't churn the rows.
-        signature = tuple((s.get("claude_pid") or s["session_id"], s.get("status"))
-                          for s in sessions)
+        signature = tuple((self.row_key(s), s.get("status")) for s in sessions)
         if signature != self.last_signature:
             self.last_signature = signature
             self.build_rows(sessions)
             self.reposition()
+
+        self.update_ages(sessions)
 
         n_attn = n_perm + n_action
         self.count_lbl.config(text=f"{n_attn} {EYE}" if n_attn else "",

@@ -41,10 +41,18 @@ $events = [ordered]@{
     SessionEnd        = @{ status = "end";        matcher = $null }
 }
 
-function New-HookGroup([string]$status, [string]$matcher) {
+function New-HookCommand([string]$status) {
+    # Claude Code runs hook commands as PowerShell, which parses a line starting
+    # with a quoted string as an expression, not a command ("Unexpected token
+    # '-E'"). The call operator makes it a command again - and the quotes have to
+    # stay, for interpreter paths containing spaces.
+    #
     # -E -s keeps a stray PYTHONPATH / user site-packages from breaking the hook.
-    $cmd = "`"$python`" -E -s `"$hook`" $status"
-    $entry = [PSCustomObject]@{ type = "command"; command = $cmd }
+    return "& `"$python`" -E -s `"$hook`" $status"
+}
+
+function New-HookGroup([string]$status, [string]$matcher) {
+    $entry = [PSCustomObject]@{ type = "command"; command = (New-HookCommand $status) }
     if ($matcher) {
         return [PSCustomObject]@{ matcher = $matcher; hooks = @($entry) }
     }
@@ -90,6 +98,72 @@ $json = ConvertTo-Json -InputObject $settings -Depth 20
 Write-Host "Installed hooks into $settingsPath" -ForegroundColor Green
 Write-Host "Interpreter: $python"
 Write-Host "Hook:        $hook"
+
+function Test-Hook {
+    # Run the hook the way Claude Code does - its command string is executed as
+    # PowerShell *script*. That matters: powershell.exe -Command happily runs a
+    # line beginning with a quoted path, a script file does not, so testing
+    # through -Command would pass on exactly the breakage this test exists to
+    # catch. Hence the detour via a temp .ps1.
+    #
+    # CLAUDE_MONITOR_STATUS_DIR keeps the probe out of the directory a running
+    # session writes to, so a live widget never flashes a fake row.
+    $probeId  = "probe-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $probeDir = Join-Path ([IO.Path]::GetTempPath()) $probeId
+    $script   = Join-Path $probeDir "hook-probe.ps1"
+    $payload  = Join-Path $probeDir "payload.json"
+    $errFile  = Join-Path $probeDir "stderr.txt"
+
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    try {
+        $json = ConvertTo-Json -Compress -InputObject ([PSCustomObject]@{
+            session_id      = $probeId
+            cwd             = $probeDir
+            hook_event_name = "InstallProbe"
+            transcript_path = ""
+        })
+        [IO.File]::WriteAllText($payload, $json, (New-Object System.Text.UTF8Encoding($false)))
+        # UTF-8 *with* BOM: powershell.exe -File assumes the ANSI codepage
+        # otherwise, which mangles a non-ASCII interpreter path.
+        [IO.File]::WriteAllText($script, (New-HookCommand "working"),
+                                (New-Object System.Text.UTF8Encoding($true)))
+
+        $env:CLAUDE_MONITOR_STATUS_DIR = $probeDir
+        $psArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`""
+        Start-Process -FilePath "powershell.exe" -ArgumentList $psArgs `
+            -RedirectStandardInput $payload -RedirectStandardError $errFile `
+            -NoNewWindow -Wait | Out-Null
+
+        if (Test-Path (Join-Path $probeDir "$probeId.json")) {
+            return $null
+        }
+        # -Encoding UTF8: powershell.exe writes its errors as UTF-8, and read
+        # back as the ANSI codepage the interpreter path in the message - the
+        # very thing you need to read - comes out as mojibake.
+        $stderr = ""
+        if (Test-Path $errFile) {
+            $stderr = (Get-Content $errFile -Raw -Encoding UTF8).Trim()
+        }
+        if (-not $stderr) { $stderr = "the hook ran but wrote no status file" }
+        return $stderr
+    } finally {
+        Remove-Item Env:\CLAUDE_MONITOR_STATUS_DIR -ErrorAction SilentlyContinue
+        Remove-Item $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$failure = Test-Hook
+if ($failure) {
+    Write-Host ""
+    Write-Host "Smoke test FAILED - the hook does not run as installed:" -ForegroundColor Red
+    Write-Host $failure
+    Write-Host ""
+    Write-Host "The hooks are registered, but Claude Code will hit the same error and"
+    Write-Host "report it only as a non-blocking hook failure, so no sessions will show up."
+    exit 1
+}
+
+Write-Host "Smoke test:  hook ran and wrote a status file" -ForegroundColor Green
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1) Reload Claude Code so it picks up the hooks"

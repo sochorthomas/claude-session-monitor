@@ -16,6 +16,9 @@ needed — and one click jumps you straight to that window.
 
 - **Live status per session** — Permission! (blue), Action! (amber), Working (green)
 - **Sorted by urgency** — sessions that need you float to the top
+- **Stale statuses are dimmed** — a green *Working* that nothing has refreshed
+  for a couple of minutes fades and picks up its age (`8m`), so a session whose
+  hooks quietly stopped arriving no longer looks busy
 - **Click to jump** — click a row to bring that session's terminal/editor window
   to the front (restores it full-screen if it was minimized)
 - **Sound alert** — a gentle chime when a session starts waiting for you;
@@ -23,7 +26,8 @@ needed — and one click jumps you straight to that window.
 - **Auto-cleanup** — closed sessions disappear even when Claude Code can't run
   its exit hook (e.g. you closed the window), and one window never shows up
   twice even when Claude Code changes a session's id mid-flight
-- **Unobtrusive** — frameless, draggable, collapsible to a thin strip
+- **Unobtrusive** — frameless and collapsible to a thin strip; drag the header
+  to move it and the right edge to resize it, and it remembers both
 - No dependencies beyond Python's standard library
 
 ## Requirements
@@ -108,6 +112,18 @@ honest:
 Consequence worth knowing: a window you open but never type into disappears
 from the list after ~3 minutes, and comes back the moment you send a prompt.
 
+### When a status goes stale
+
+A status file only changes when a hook fires, so a row is really "the last thing
+Claude Code told us", not "what is happening now". After `STALE_AFTER` seconds
+(2 min) without an update the row fades and shows its age — either the session
+is deep in one long tool call, or its hooks have stopped arriving and the row is
+lying to you. Both are worth seeing.
+
+**Action!** and **Permission!** are exempt: those are states a session sits in on
+purpose while it waits for you, sometimes for hours, so ageing them would dim
+exactly the rows you care about.
+
 ### Repository layout
 
 The three things you run yourself sit in the root; everything they call lives in
@@ -124,15 +140,21 @@ scripts/start-monitor.ps1 finds Python, launches widget.pyw
 
 ## Controls
 
-- **Drag** the header to move the box.
+- **Drag** the header to move the box. It grows upward from wherever you leave
+  it, so a new session never pushes it down the screen.
+- **Drag the right edge** to change the width.
 - **Click a row** to focus that session's window.
 - **Hover a shortened name** (one ending in `…`) to see the full project name in
   a tooltip. The status label always keeps its space, so it stays readable no
   matter how long the project name is.
-- **`♪`** toggles the notification sound (struck through = muted). The choice is
-  remembered in `~/.claude/session-monitor-config.json`.
+- **`♪`** toggles the notification sound (struck through = muted).
 - **Chevron `▾/▸`** (or double-click the header) collapses the box to a strip.
-- **`×`** closes the widget. **Right-click** for a small menu.
+- **`×`** closes the widget. **Right-click** for a small menu, including
+  *Reset position* if you lose the box off the edge of a screen.
+
+Position, width and the sound toggle are remembered in
+`~/.claude/session-monitor-config.json`. A saved position on a monitor that is
+no longer attached is ignored rather than leaving the box off-desktop.
 
 ## Uninstall
 
@@ -150,6 +172,19 @@ Claude Code. Close the widget with its `×` button.
   `/hooks` inside Claude Code.
 - **Still nothing after reloading.** Check `install.ps1` completed without errors
   and that `python`/`pythonw` are on your `PATH`.
+- **One session is missing while others show up.** The hook is probably failing
+  in that session only; Claude Code reports it as a non-blocking hook error
+  rather than surfacing it. A hook command written by an older `install.ps1`
+  starts with a quoted path, which PowerShell parses as an expression instead of
+  a command (`Unexpected token '-E'`). Re-run `install.ps1` — the current one
+  prefixes the command with the call operator (`&`) and finishes by smoke-testing
+  the hook exactly the way Claude Code runs it.
+- **Is the hook even running?** Set `CLAUDE_MONITOR_DEBUG=1` in the environment
+  Claude Code starts from and watch `~/.claude/session-monitor-hook.log`: a line
+  per invocation means the hook ran (and says what it wrote), while *no* line at
+  all means Claude Code never managed to start it — a broken hook command, a
+  missing interpreter. The hook always exits 0 so it can never block Claude
+  Code, which is exactly why those two cases otherwise look identical.
 - **It stopped working after I moved or reinstalled Python.** The interpreter
   path is baked into the hook command, so re-run `install.ps1`. Same after
   moving the repository itself.

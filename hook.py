@@ -18,7 +18,10 @@ owning ``claude`` process is found by walking the parent chain directly rather
 than enumerating every process on the machine.
 
 It must also never fail in a way that blocks Claude Code, so every side effect
-is wrapped in try/except and the process always exits 0.
+is wrapped in try/except and the process always exits 0. Set
+``CLAUDE_MONITOR_DEBUG=1`` to have it record what it did in
+``~/.claude/session-monitor-hook.log``, which is the only way to tell a hook
+that ran and failed from one Claude Code never managed to start.
 """
 import sys
 import os
@@ -27,7 +30,21 @@ import time
 import ctypes
 from ctypes import wintypes
 
-STATUS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "session-status")
+# The override exists so install.ps1 can smoke-test the hook against a
+# throwaway directory instead of the one live sessions are writing to.
+# ``widget.pyw`` reads the same variable, so setting it permanently just moves
+# the status files somewhere else.
+STATUS_DIR = (os.environ.get("CLAUDE_MONITOR_STATUS_DIR")
+              or os.path.join(os.path.expanduser("~"), ".claude", "session-status"))
+
+# Opt-in diagnostics. This hook must never break Claude Code, so it swallows
+# every error and always exits 0 - which means a broken install looks exactly
+# like "no sessions running". Set CLAUDE_MONITOR_DEBUG=1 to leave a trail: a
+# line per invocation says the hook ran, and the *absence* of one says Claude
+# Code never got as far as starting it (a hook command it cannot parse, say).
+DEBUG = bool(os.environ.get("CLAUDE_MONITOR_DEBUG"))
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "session-monitor-hook.log")
+LOG_MAX_BYTES = 1 << 20
 
 MAX_ANCESTRY_DEPTH = 8
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -70,6 +87,30 @@ _ntdll.NtQueryInformationProcess.argtypes = [
     ctypes.POINTER(ctypes.c_ulong),
 ]
 _ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+
+def debug_log(message: str) -> None:
+    """Append one line to the debug log. A no-op unless ``DEBUG`` is set.
+
+    Starts the file over once it passes ``LOG_MAX_BYTES`` instead of rotating:
+    a diagnostic log is read right after reproducing the problem, so the recent
+    lines are the only ones worth keeping, and an unbounded file on a hook that
+    runs per tool call is a worse failure than a lost history.
+    """
+    if not DEBUG:
+        return
+    try:
+        mode = "a"
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                mode = "w"
+        except OSError:
+            pass
+        with open(LOG_PATH, mode, encoding="utf-8") as f:
+            f.write("%s pid=%d %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        os.getpid(), message))
+    except Exception:
+        pass
 
 
 def parent_and_name(pid: int):
@@ -255,6 +296,7 @@ def main() -> None:
     try:
         data = json.loads(raw) if raw else {}
     except Exception:
+        debug_log("unparseable payload (%d bytes): %.200r" % (len(raw), raw))
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -273,6 +315,7 @@ def main() -> None:
             os.remove(path)
         except OSError:
             pass
+        debug_log("end session=%s" % session_id)
         return
 
     status = resolve_status(status, data)
@@ -301,13 +344,21 @@ def main() -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f)
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as exc:
+        debug_log("write failed for %s: %r" % (path, exc))
+        return
+
+    debug_log("%s -> %s session=%s claude_pid=%s project=%s"
+              % (event or "?", status, session_id, claude_pid, project))
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        pass
+        try:
+            import traceback
+            debug_log("crash:\n" + traceback.format_exc())
+        except Exception:
+            pass
     sys.exit(0)
