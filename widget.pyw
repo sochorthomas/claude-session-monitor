@@ -660,6 +660,7 @@ WM_APP = 0x8000
 TRAY_CALLBACK = WM_APP + 1
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
+WM_CLOSE = 0x0010
 WM_LBUTTONUP, WM_RBUTTONUP = 0x0202, 0x0205
 SM_CXSMICON = 49
 TRAY_CLASS = "ClaudeSessionMonitorTray"
@@ -840,6 +841,12 @@ class Tray:
                     self.monitor.toggle_visible()
                 elif event == WM_RBUTTONUP:
                     self.monitor.popup_menu_at_cursor()
+                return 0
+            if msg == WM_CLOSE:
+                # How uninstall.ps1 (or anything else) asks the widget to go
+                # away. Deferred onto the Tk loop rather than run here, so the
+                # window is not destroyed while it is handling its own message.
+                self.monitor.root.after(0, self.monitor.quit)
                 return 0
             if msg and msg == self._taskbar_created:
                 self.shown = False

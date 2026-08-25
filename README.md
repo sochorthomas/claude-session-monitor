@@ -187,8 +187,21 @@ size — it scales the text along with everything else.
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
-This removes only this tool's hooks from `~/.claude/settings.json`, then reload
-Claude Code. Close the widget with its `×` button.
+Four steps, each reported as it happens:
+
+1. **Stops the widget** — by asking it to close, so it takes its own tray icon
+   with it. Only if it will not go quietly is the process killed.
+2. **Unregisters the hooks** — only this tool's entries in
+   `~/.claude/settings.json`; your own hooks on the same events survive.
+3. **Deletes what the tool wrote** — `session-status/`, the config file and the
+   debug log, all under `~/.claude`. Pass `-KeepData` to leave the status
+   directory and your saved position, width and sound setting for a reinstall.
+4. **Removes a Startup shortcut** — but only one pointing at this copy of
+   `start-monitor.vbs`, which would otherwise bring the widget back at the next
+   login.
+
+Then reload Claude Code so it stops trying to run the hooks. The repository
+itself is left alone — delete the folder to finish.
 
 ## Troubleshooting
 
